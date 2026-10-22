@@ -5,10 +5,12 @@ import sys
 import tempfile
 import tkinter as tk
 from tkinter import ttk
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from deviceviewer.display import enable_dpi_awareness
 from deviceviewer.app import App
+from deviceviewer import startup
 from pystray._util import win32
 
 shell_calls = []
@@ -31,7 +33,11 @@ def descendants(widget):
 
 
 enable_dpi_awareness()
-app = App()
+# Exercise the real settings callbacks without changing the user's Run key.
+registration = {'entry': None}
+startup.read_registration = lambda: registration['entry']
+startup.write_registration = lambda entry: registration.update(entry=entry)
+app = App(background=True)
 scratch = tempfile.TemporaryDirectory(prefix='deviceviewer-ui-', dir=Path(__file__).resolve().parents[1] / 'build')
 app.config_path = Path(scratch.name) / 'settings.json'
 app.config['alerts'] = False
@@ -44,9 +50,12 @@ def callback_error(kind, error, traceback):
 
 
 app.root.report_callback_exception = callback_error
+app.root.after(30000, lambda: app.quit() if not app.closed else None)
 
 
 def open_settings():
+    assert app.root.state() == 'withdrawn', 'Background startup unexpectedly opened the main window'
+    app.show()
     app.settings()
     app.root.after(500, verify)
 
@@ -61,6 +70,9 @@ def verify():
         assert not any(isinstance(w, tk.Checkbutton) and '置顶' in w.cget('text') for w in all_widgets)
         assert not bool(app.root.attributes('-topmost')), 'Window unexpectedly stays on top'
         threshold, tray = [w for w in all_widgets if isinstance(w, ttk.Combobox)]
+        autostart = next(w for w in all_widgets if isinstance(w, tk.Checkbutton) and '开机自启动' in w.cget('text'))
+        assert not startup.is_enabled(), 'Startup should be off by default'
+        autostart.invoke()
         assert tuple(map(int, threshold['values'])) == (10, 20, 30, 40, 50)
         assert threshold.get() == str(app.config['threshold'])
         threshold.set('30')
@@ -75,6 +87,8 @@ def verify():
         save = next(w for w in all_widgets if isinstance(w, tk.Button) and w.cget('text') == '保存设置')
         assert save.winfo_y() + save.winfo_height() <= win.winfo_height(), 'Save button clipped'
         save.invoke()
+        assert startup.is_enabled(), 'Startup checkbox was not applied on save'
+        assert registration['entry'][0].endswith(' --background')
         saved = json.loads(app.config_path.read_text(encoding='utf-8'))
         assert saved['threshold'] == 30
         assert saved['tray_device'] == original_keys[0]
@@ -91,6 +105,18 @@ def verify():
         controls = [w for w in descendants(app.settings_window) if isinstance(w, ttk.Combobox)]
         assert controls[0].get() == '30', 'Threshold was not restored'
         assert controls[1].current() > 0, 'Selected tray device was not restored'
+        widgets = list(descendants(app.settings_window))
+        autostart = next(w for w in widgets if isinstance(w, tk.Checkbutton) and '开机自启动' in w.cget('text'))
+        assert app.root.getvar(autostart.cget('variable')) == 1, 'Startup checkbox was not restored'
+        autostart.invoke()
+        save = next(w for w in widgets if isinstance(w, tk.Button) and w.cget('text') == '保存设置')
+        with patch.object(app, 'save_config', side_effect=PermissionError('test: configuration is read-only')):
+            with patch('deviceviewer.app.messagebox.showerror') as error_dialog:
+                save.invoke()
+                assert error_dialog.called, 'Save failure was hidden'
+        assert startup.is_enabled(), 'Failed settings save did not restore previous startup registration'
+        save.invoke()
+        assert registration['entry'] is None, 'Startup checkbox did not remove registration'
         print(json.dumps({'dpi': app.dpi, 'scale': app.scale,
                           'devices': [(s.name, s.percent) for s in app.states],
                           'tray_ready': app.tray_ready, 'settings_saved': True}, ensure_ascii=False), flush=True)

@@ -13,6 +13,7 @@ from PIL import ImageTk
 from .devices import scan
 from .display import battery_icon, window_dpi
 from .preferences import normalize_config, ordered_devices, selected_device, is_low, THRESHOLDS
+from . import startup
 
 BG = '#10141e'
 CARD = '#1b2231'
@@ -23,8 +24,10 @@ BLUE = '#81aaff'
 
 
 class App:
-    def __init__(self):
+    def __init__(self, background=False):
         self.root = tk.Tk()
+        if background:
+            self.root.withdraw()
         self.dpi = window_dpi(self.root)
         self.scale = self.dpi / 96
         self.root.tk.call('tk', 'scaling', self.dpi / 72)
@@ -230,10 +233,12 @@ class App:
                         self.show_tray()
                     except OSError as exc:
                         self.tray_ready = False
+                        self.show()
                         self.status.configure(text='托盘图标创建失败：' + str(exc))
                     continue
                 elif kind == 'tray_error':
                     self.tray_ready = False
+                    self.show()
                     self.status.configure(text='系统托盘不可用，可继续在窗口查看电量')
                     continue
                 self.busy = False
@@ -332,9 +337,16 @@ class App:
         win.configure(bg=CARD)
         self.label(win, '电量提醒与托盘', 16, bold=True).pack(pady=(20, 12))
         alerts = tk.BooleanVar(value=self.config['alerts'])
+        try:
+            startup_enabled = startup.is_enabled()
+        except OSError as exc:
+            win.destroy()
+            messagebox.showerror('无法读取开机启动设置', str(exc), parent=self.root)
+            return
+        autostart = tk.BooleanVar(value=startup_enabled)
         interval = tk.StringVar(value=str(self.config['interval']))
         threshold = tk.StringVar(value=str(self.config['threshold']))
-        for text, var in [('开启低电量提醒', alerts)]:
+        for text, var in [('开机自启动（登录后在托盘运行）', autostart), ('开启低电量提醒', alerts)]:
             tk.Checkbutton(win, text=text, variable=var, bg=CARD, fg=FG, selectcolor=BG,
                            activebackground=CARD, activeforeground=FG, font=('Microsoft YaHei UI', 11)).pack(anchor='w', padx=32, pady=6)
         threshold_row = tk.Frame(win, bg=CARD)
@@ -407,9 +419,26 @@ class App:
                                threshold=int(threshold.get()), device_order=order,
                                tray_device=choices[tray_choice.current()])
             try:
+                previous_startup = startup.read_registration()
+                # Apply only an explicit change. Merely saving unrelated settings
+                # must not remove another installation's startup registration.
+                startup_changed = autostart.get() != startup_enabled
+                if startup_changed:
+                    startup.set_enabled(autostart.get())
+            except OSError as exc:
+                self.config = old_config
+                messagebox.showerror('开机启动设置失败', str(exc), parent=win)
+                return
+            try:
                 self.save_config()
             except OSError as exc:
                 self.config = old_config
+                if startup_changed:
+                    try:
+                        startup.write_registration(previous_startup)
+                    except OSError as rollback_error:
+                        messagebox.showerror('保存失败', f'{exc}\n开机启动恢复失败：{rollback_error}', parent=win)
+                        return
                 messagebox.showerror('保存失败', str(exc), parent=win)
                 return
             if old_threshold != self.config['threshold'] or old_alerts != self.config['alerts']:
