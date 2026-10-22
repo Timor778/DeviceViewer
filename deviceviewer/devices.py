@@ -51,42 +51,86 @@ def read_sony(device):
     raise TimeoutError('耳机未响应，请确认已开机；也可退出 INZONE Hub 后重试')
 
 
+class HidppError(RuntimeError):
+    pass
+
+
 class Hidpp:
-    def __init__(self, device, index, long_report=True):
+    def __init__(self, device, index, long_report=True, software_id=None):
         self.device, self.index, self.long_report = device, index, long_report
+        self.software_id = secrets.randbelow(15) + 1 if software_id is None else software_id
+        self._features = {}
 
     def query(self, feature, function=0, params=b''):
-        # HID++ short report; software ID 0xA distinguishes our replies.
-        function = function | 0xA
+        # Discard pending replies, then use a different nonzero software ID for
+        # each transaction. ROOT replies don't echo their requested feature ID.
+        for _ in range(32):
+            if not self.device.read(64, 1):
+                break
+        self.software_id = self.software_id % 15 + 1
+        function = (function & 0xF0) | self.software_id
         size, rid = (20, 0x11) if self.long_report else (7, 0x10)
         packet = (bytes([rid, self.index, feature, function]) + params).ljust(size, b'\0')
-        if self.device.write(packet) < 0:
+        if self.device.write(packet) != len(packet):
             raise OSError('无法发送电量查询')
         deadline = time.monotonic() + .65
         while time.monotonic() < deadline:
             b = bytes(self.device.read(64, 100))
-            if len(b) < 7 or b[1] != self.index:
+            if not b or b[0] not in (0x10, 0x11):
+                continue
+            if len(b) < (7 if b[0] == 0x10 else 20) or b[1] != self.index:
                 continue
             if b[2:4] == bytes([feature, function]):
                 return b[4:]
             if b[2] in (0x8F, 0xFF) and b[3:5] == bytes([feature, function]):
-                return None
-        return None
+                raise HidppError('设备拒绝电量查询，等待下次刷新')
+        raise HidppError('设备响应超时，等待唤醒后刷新')
 
     def feature(self, number):
-        reply = self.query(0, params=number.to_bytes(2, 'big'))
-        return reply[0] if reply else 0
+        if number in self._features:
+            return self._features[number]
+        for _ in range(2):
+            try:
+                reply = self.query(0, params=number.to_bytes(2, 'big'))
+                index = reply[0]
+                if not index:
+                    return 0  # Explicitly absent, unlike a timeout/error.
+                feature_set = index if number == 1 else self.feature(1)
+                if not feature_set:
+                    raise HidppError('设备缺少特性校验接口')
+                identity = self.query(feature_set, 0x10, bytes([index]))
+                if identity[:2] == number.to_bytes(2, 'big'):
+                    self._features[number] = index
+                    return index
+            except HidppError:
+                continue
+        raise HidppError('设备响应与请求的电量协议不匹配，已忽略本次读数')
 
     def battery(self):
         for number, function in ((0x1004, 0x10), (0x1000, 0)):
             feature = self.feature(number)
             if not feature:
                 continue
-            b = self.query(feature, function)
-            if b and len(b) >= 3 and b[0] <= 100:
-                if b[0] == 0:
-                    raise RuntimeError('设备未提供精确百分比，等待唤醒后重试')
-                return b[0], b[2] in (1, 2, 4), f'HID++ · {number:04X}'
+            previous = None
+            for _ in range(3):
+                try:
+                    b = self.query(feature, function)
+                except HidppError:
+                    previous = None
+                    continue
+                if len(b) < 3 or not 0 < b[0] <= 100 or b[2] > 7:
+                    previous = None
+                    continue
+                if number == 0x1004 and b[1] not in (0, 1, 2, 4, 8):
+                    previous = None
+                    continue
+                reading = b[0], b[2]
+                if reading == previous:
+                    return b[0], b[2] in (1, 2, 4), f'HID++ · {number:04X}'
+                previous = reading
+            # Once a supported battery feature is found, an unreliable reading
+            # is not a reason to reinterpret a different feature as legacy battery.
+            raise HidppError('电量响应未确认一致，已忽略本次读数，等待下次刷新')
         raise RuntimeError('未收到电量；请移动鼠标唤醒后重试，或此型号需要另行适配')
 
     def name(self):
@@ -130,7 +174,10 @@ def scan():
                     try:
                         peer = Hidpp(device, slot, d['usage'] == 2)
                         state.percent, state.charging, state.protocol = peer.battery()
-                        state.name = peer.name() or state.name
+                        try:
+                            state.name = peer.name() or state.name
+                        except HidppError:
+                            pass  # A name lookup failure must not invalidate a confirmed battery reading.
                         break
                     except RuntimeError as exc:
                         last_error = exc
